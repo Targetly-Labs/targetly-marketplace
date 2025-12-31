@@ -33,7 +33,12 @@ if not SERVER_SCRIPT or not os.path.exists(SERVER_SCRIPT):
 
 # Determine Command to Run
 CMD = []
-if SERVER_SCRIPT and os.path.exists(SERVER_SCRIPT):
+# 1. Explicit full command override
+if os.environ.get("TARGETLY_MCP_CMD"):
+    import shlex
+    CMD = shlex.split(os.environ.get("TARGETLY_MCP_CMD"))
+# 2. Script-based execution
+elif SERVER_SCRIPT and os.path.exists(SERVER_SCRIPT):
     CMD = ["python", SERVER_SCRIPT]
 elif os.path.exists("pyproject.toml"):
     # Attempt to detect project name or default to 'uv run'
@@ -54,10 +59,12 @@ if not CMD:
 print(f"Targetly Adapter: Starting server with command: {CMD}")
 
 # Append any additional arguments passed to the adapter
-# If we used ENV for script, args start at sys.argv[1].
-# If we used sys.argv[1] for script, args start at sys.argv[2].
+# If TARGETLY_MCP_CMD is used, we append args from sys.argv[1:]
+# If SERVER_SCRIPT (via env or argv) is used, we append appropriately.
 extra_args = []
-if os.environ.get("TARGETLY_MCP_SERVER_SCRIPT"):
+if os.environ.get("TARGETLY_MCP_CMD"):
+     extra_args = sys.argv[1:]
+elif os.environ.get("TARGETLY_MCP_SERVER_SCRIPT"):
    extra_args = sys.argv[1:]
 elif len(sys.argv) > 1:
    extra_args = sys.argv[2:]
