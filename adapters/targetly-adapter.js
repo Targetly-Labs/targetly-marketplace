@@ -3,195 +3,173 @@
  * ----------------------------------
  * This adapter wraps a stdio-based MCP server (running via command line)
  * and exposes it over SSE (Server-Sent Events) for the Targetly platform.
- * It handles bridging HTTP POST requests to stdin and stdout to SSE events.
+ *
+ * Key protocol details (from MCP SDK):
+ * 1. GET /sse -> SSE stream. First event is `endpoint` with `data: /messages?session_id=<uuid>`.
+ * 2. SSE messages use `event: message` with JSON-RPC in `data:`.
+ * 3. POST /messages?session_id=<uuid> -> Forward to stdin. Returns 202 Accepted.
  */
 
-// Core node modules
 const { spawn } = require("child_process");
 const fs = require('fs');
-
-// External dependencies
+const crypto = require('crypto');
 const express = require("express");
 
 // Configuration
 const PORT = process.env.PORT || 8080;
-let SERVER_SCRIPT = process.env.TARGETLY_MCP_SERVER_SCRIPT || process.argv[2]; // Path to the original server script
+const DEBUG = process.env.TARGETLY_DEBUG === "true" || process.env.TARGETLY_DEBUG === "1";
 
-// SMART DETECTION: Try to find entrypoint from package.json if not provided
-if (!SERVER_SCRIPT || !fs.existsSync(SERVER_SCRIPT)) {
-    try {
-        const packageJson = require('./package.json');
-
-        // 1. Check 'bin' field (Standard for CLI tools)
-        if (packageJson.bin) {
-            if (typeof packageJson.bin === 'string') {
-                SERVER_SCRIPT = packageJson.bin;
-            } else if (typeof packageJson.bin === 'object') {
-                const keys = Object.keys(packageJson.bin);
-                if (keys.length > 0) {
-                    SERVER_SCRIPT = packageJson.bin[keys[0]];
-                }
-            }
-        }
-
-        // 2. Check 'main' field (Standard for libraries/apps)
-        if ((!SERVER_SCRIPT || !fs.existsSync(SERVER_SCRIPT)) && packageJson.main) {
-            SERVER_SCRIPT = packageJson.main;
-        }
-
-    } catch (e) {
-        // Ignore errors, unnecessary to log in production
-    }
-}
-
-// Fallback: Common entrypoint paths
-const POSSIBLE_PATHS = [
-    "./build/index.js",
-    "./dist/index.js",
-    "./src/index.js",
-    "./index.js"
-];
-
-if (!SERVER_SCRIPT || !fs.existsSync(SERVER_SCRIPT)) {
-    // Only search fallback if TARGETLY_MCP_CMD is NOT set. 
-    // If TARGETLY_MCP_CMD is set, we don't necessarily need a script file.
-    if (!process.env.TARGETLY_MCP_CMD) {
-        const found = POSSIBLE_PATHS.find(p => fs.existsSync(p));
-        if (found) {
-            SERVER_SCRIPT = found;
-        } else {
-            // We only error out later if we actually try to use SERVER_SCRIPT
-        }
-    }
-}
-
-
-// Wrap execution in async to support dynamic import
-(async () => {
-    let SSEServerTransport;
-    try {
-        // Dynamic import to handle ESM/CJS compatibility for the SDK
-        const sdk = await import("@modelcontextprotocol/sdk/server/sse.js");
-        SSEServerTransport = sdk.SSEServerTransport;
-    } catch (e) {
-        console.error("Targetly Adapter: Failed to load @modelcontextprotocol/sdk. Ensure it is installed.", e);
-        process.exit(1);
-    }
-
+// --- Command Detection ---
+function getServerCommand() {
+    // 1. Explicit full command override
     if (process.env.TARGETLY_MCP_CMD) {
-        console.log(`Targetly Adapter: Starting server via CMD: ${process.env.TARGETLY_MCP_CMD}`);
-    } else {
-        console.log(`Targetly Adapter: Starting server for: ${SERVER_SCRIPT}`);
-    }
-
-    const app = express();
-
-    /** 
-     * Transport Handling
-     * ------------------
-     * We instantiate the SSEServerTransport per connection because the SDK
-     * design ties the transport lifecycle to the response object.
-     */
-    let transport = null;
-
-    // Determine Command and Args
-    let command = "node"; // Default to node
-    let args = [];
-
-    if (process.env.TARGETLY_MCP_CMD) {
-        // Split command string into command and args
         const parts = process.env.TARGETLY_MCP_CMD.split(" ");
-        command = parts[0];
-        args = parts.slice(1);
-        // Append any extra args passed to the adapter
-        args = args.concat(process.argv.slice(2));
-    } else if (SERVER_SCRIPT) { // Use SERVER_SCRIPT if resolved
-        // Script provided via ENV or resolved
-        args = [SERVER_SCRIPT];
-        args = args.concat(process.argv.slice(3)); // Note: argv indices depend on how we are called. 
-        // If typically called as `node adapter.js`, args start at 2.
-        // Wait, line 16 uses process.argv[2] as possible script.
-        // If script came from argv[2], extra args are at 3+.
-        // If script came from ENV, extra args are at 2+.
-        // Let's refine logical consistency:
-        if (process.env.TARGETLY_MCP_SERVER_SCRIPT) {
-            // extra args start at 2
-            args = [SERVER_SCRIPT].concat(process.argv.slice(2));
-        } else {
-            // extra args start at 3 (2 was the script)
-            args = [SERVER_SCRIPT].concat(process.argv.slice(3));
-        }
-    } else {
-        console.error("Targetly Adapter Error: No server script specified via TARGETLY_MCP_SERVER_SCRIPT, TARGETLY_MCP_CMD or command line.");
+        return { command: parts[0], args: parts.slice(1) };
+    }
+
+    // 2. Script-based execution
+    let serverScript = process.env.TARGETLY_MCP_SERVER_SCRIPT || process.argv[2];
+
+    if (!serverScript || !fs.existsSync(serverScript)) {
+        try {
+            const packageJson = require('./package.json');
+            if (packageJson.bin) {
+                if (typeof packageJson.bin === 'string') {
+                    serverScript = packageJson.bin;
+                } else if (typeof packageJson.bin === 'object') {
+                    const keys = Object.keys(packageJson.bin);
+                    if (keys.length > 0) serverScript = packageJson.bin[keys[0]];
+                }
+            }
+            if ((!serverScript || !fs.existsSync(serverScript)) && packageJson.main) {
+                serverScript = packageJson.main;
+            }
+        } catch (e) { }
+    }
+
+    // 3. Fallback paths
+    if (!serverScript || !fs.existsSync(serverScript)) {
+        const fallbacks = ["./dist/index.js", "./build/index.js", "./src/index.js", "./index.js"];
+        serverScript = fallbacks.find(p => fs.existsSync(p));
+    }
+
+    if (!serverScript) {
+        console.error("Targetly Adapter Error: No server script found.");
         process.exit(1);
     }
 
-    console.log(`Targetly Adapter: Spawning ${command} with args: ${JSON.stringify(args)}`);
+    return { command: "node", args: [serverScript] };
+}
 
-    // Spawn the child process
-    const child = spawn(command, args, {
-        stdio: ["pipe", "pipe", "inherit"], // Write to 0, read from 1, pass stderr through
-    });
+const { command, args } = getServerCommand();
+console.log(`Targetly Adapter: Starting server with command: ${command} ${args.join(" ")}`);
 
-    child.on("error", (err) => {
-        console.error("Targetly Adapter: Failed to spawn child process:", err);
-    });
+// Spawn the child process
+const child = spawn(command, args, {
+    stdio: ["pipe", "pipe", "inherit"],
+});
 
-    child.on("exit", (code) => {
-        console.error(`Targetly Adapter: Child process exited with code ${code}`);
-        process.exit(code || 1);
-    });
+child.on("error", (err) => {
+    console.error("Targetly Adapter: Failed to spawn child process:", err);
+});
 
-    // SSE Endpoint
-    app.get("/sse", async (req, res) => {
-        transport = new SSEServerTransport("/messages", res);
+child.on("exit", (code) => {
+    console.error(`Targetly Adapter: Child process exited with code ${code}`);
+    process.exit(code || 1);
+});
 
-        // Bridge: Stdio -> Web (SSE)
-        transport.onmessage = (message) => {
-            const jsonLine = JSON.stringify(message) + "\n";
-            child.stdin.write(jsonLine);
-        };
+// Session management
+const sessions = new Map();
 
-        await transport.start();
+// Read stdout and dispatch to all sessions
+let buffer = "";
+child.stdout.on("data", (chunk) => {
+    buffer += chunk.toString();
+    const lines = buffer.split("\n");
+    buffer = lines.pop();
 
-        // CRITICAL: Send the endpoint event immediately so the client knows where to POST
-        res.write("event: endpoint\n");
-        res.write("data: /messages\n\n");
-    });
+    for (const line of lines) {
+        if (!line.trim()) continue;
 
-    // POST Endpoint
-    app.post("/messages", async (req, res) => {
-        if (transport) {
-            await transport.handlePostMessage(req, res);
-        } else {
-            res.status(404).json({ error: "No active connection" });
-        }
-    });
+        try {
+            JSON.parse(line); // Validate JSON
+            if (DEBUG) console.log("Targetly Adapter: OUTGOING:", line);
 
-    // Bridge: Stdio -> Web (SSE)
-    // We listen to the child's stdout continuously and forward to the *current* transport.
-    let buffer = "";
-    child.stdout.on("data", (chunk) => {
-        buffer += chunk.toString();
-        const lines = buffer.split("\n");
-        buffer = lines.pop(); // Keep partial line
-
-        for (const line of lines) {
-            if (line.trim()) {
-                try {
-                    const message = JSON.parse(line);
-                    if (transport) {
-                        transport.send(message);
-                    }
-                } catch (err) {
-                    console.error("Targetly Adapter: Invalid JSON from child:", line);
-                }
+            // Dispatch to all active sessions
+            for (const [sessionId, res] of sessions) {
+                res.write(`event: message\n`);
+                res.write(`data: ${line}\n\n`);
+                if (DEBUG) console.log(`Targetly Adapter: Dispatched to session ${sessionId}`);
             }
+        } catch (err) {
+            console.error("Targetly Adapter: Invalid JSON from child:", line);
         }
-    });
+    }
+});
 
-    const server = app.listen(PORT, () => {
-        console.log(`Targetly Adapter listening on port ${PORT}`);
-    });
+// Express app
+const app = express();
 
-})();
+// CORS
+app.use((req, res, next) => {
+    res.header("Access-Control-Allow-Origin", "*");
+    res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    res.header("Access-Control-Allow-Headers", "*");
+    if (req.method === 'OPTIONS') return res.sendStatus(200);
+    next();
+});
+
+app.use(express.json());
+app.use(express.text({ type: "*/*" }));
+
+// SSE Endpoint
+app.get("/sse", (req, res) => {
+    const sessionId = crypto.randomUUID();
+
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Connection", "keep-alive");
+    res.flushHeaders();
+
+    sessions.set(sessionId, res);
+    if (DEBUG) console.log(`Targetly Adapter: New SSE session: ${sessionId}`);
+
+    // Send endpoint event
+    res.write(`event: endpoint\n`);
+    res.write(`data: /messages?session_id=${sessionId}\n\n`);
+
+    // Keep-alive ping
+    const pingInterval = setInterval(() => {
+        res.write(`: ping\n\n`);
+    }, 15000);
+
+    req.on("close", () => {
+        clearInterval(pingInterval);
+        sessions.delete(sessionId);
+        if (DEBUG) console.log(`Targetly Adapter: Session ${sessionId} closed`);
+    });
+});
+
+// POST Endpoint
+app.post("/messages", (req, res) => {
+    const sessionId = req.query.session_id;
+
+    if (!sessionId || !sessions.has(sessionId)) {
+        if (DEBUG) console.log(`Targetly Adapter: Invalid session_id: ${sessionId}`);
+        return res.status(400).send("Invalid or missing session_id");
+    }
+
+    let body = req.body;
+    if (typeof body === "object") {
+        body = JSON.stringify(body);
+    }
+
+    if (DEBUG) console.log(`Targetly Adapter: INCOMING: ${body}`);
+
+    child.stdin.write(body + "\n");
+    res.status(202).send("Accepted");
+});
+
+app.listen(PORT, () => {
+    console.log(`Targetly Adapter listening on port ${PORT}`);
+});
